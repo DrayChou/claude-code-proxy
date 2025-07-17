@@ -4,6 +4,7 @@ from venv import logger
 from src.core.constants import Constants
 from src.models.claude import ClaudeMessagesRequest, ClaudeMessage
 from src.core.config import config
+from src.core.token_manager import token_manager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,18 @@ def convert_claude_to_openai(
                     openai_messages.extend(tool_results)
 
         i += 1
+
+    # Check and truncate input tokens if enabled
+    if config.enable_token_truncation:
+        input_tokens = token_manager.count_message_tokens(openai_messages, openai_model)
+        logger.debug(f"Input tokens before truncation: {input_tokens}")
+        
+        if input_tokens > config.max_input_tokens:
+            openai_messages = token_manager.truncate_messages(
+                openai_messages, config.max_input_tokens, openai_model
+            )
+            final_tokens = token_manager.count_message_tokens(openai_messages, openai_model)
+            logger.info(f"Truncated input from {input_tokens} to {final_tokens} tokens")
 
     # Build OpenAI request
     openai_request = {

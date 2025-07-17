@@ -175,3 +175,9 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 n
+
+# SpecStory explanation file
+.lh
+.specstory
+.claude
+start-claude.ps1

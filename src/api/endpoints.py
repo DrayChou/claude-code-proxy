@@ -14,6 +14,7 @@ from src.conversion.response_converter import (
     convert_openai_streaming_to_claude_with_cancellation,
 )
 from src.core.model_manager import model_manager
+from src.core.token_manager import token_manager
 
 router = APIRouter()
 
@@ -121,35 +122,32 @@ async def create_message(request: ClaudeMessagesRequest, http_request: Request, 
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(request: ClaudeTokenCountRequest, _: None = Depends(validate_api_key)):
     try:
-        # For token counting, we'll use a simple estimation
-        # In a real implementation, you might want to use tiktoken or similar
-
-        total_chars = 0
-
-        # Count system message characters
-        if request.system:
-            if isinstance(request.system, str):
-                total_chars += len(request.system)
-            elif isinstance(request.system, list):
-                for block in request.system:
-                    if hasattr(block, "text"):
-                        total_chars += len(block.text)
-
-        # Count message characters
-        for msg in request.messages:
-            if msg.content is None:
-                continue
-            elif isinstance(msg.content, str):
-                total_chars += len(msg.content)
-            elif isinstance(msg.content, list):
-                for block in msg.content:
-                    if hasattr(block, "text") and block.text is not None:
-                        total_chars += len(block.text)
-
-        # Rough estimation: 4 characters per token
-        estimated_tokens = max(1, total_chars // 4)
-
-        return {"input_tokens": estimated_tokens}
+        # Convert Claude request to OpenAI format for accurate token counting
+        openai_request = convert_claude_to_openai(request, model_manager)
+        openai_model = openai_request["model"]
+        openai_messages = openai_request["messages"]
+        
+        # Use tiktoken for accurate token counting
+        input_tokens = token_manager.count_message_tokens(openai_messages, openai_model)
+        
+        # Get context window info
+        context_window = token_manager.get_context_window_size(openai_model)
+        
+        logger.debug(f"Token count for model {openai_model}: {input_tokens} tokens")
+        
+        response = {"input_tokens": input_tokens}
+        
+        # Add additional info if requested
+        if hasattr(request, 'include_details') and getattr(request, 'include_details', False):
+            response.update({
+                "model_used": openai_model,
+                "context_window": context_window,
+                "remaining_tokens": max(0, context_window - input_tokens),
+                "truncation_enabled": config.enable_token_truncation,
+                "max_input_tokens": config.max_input_tokens
+            })
+        
+        return response
 
     except Exception as e:
         logger.error(f"Error counting tokens: {e}")
@@ -216,6 +214,8 @@ async def root():
         "config": {
             "openai_base_url": config.openai_base_url,
             "max_tokens_limit": config.max_tokens_limit,
+            "max_input_tokens": config.max_input_tokens,
+            "token_truncation_enabled": config.enable_token_truncation,
             "api_key_configured": bool(config.openai_api_key),
             "client_api_key_validation": bool(config.anthropic_api_key),
             "big_model": config.big_model,
