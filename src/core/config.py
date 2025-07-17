@@ -27,7 +27,7 @@ class Config:
         self.proactive_compression_threshold = float(os.environ.get("PROACTIVE_COMPRESSION_THRESHOLD", "0.8"))  # 80% of max tokens
         self.compression_target_ratio = float(os.environ.get("COMPRESSION_TARGET_RATIO", "0.6"))  # Compress to 60% of max tokens
         self.enable_ai_compression = os.environ.get("ENABLE_AI_COMPRESSION", "true").lower() == "true"  # Use AI for compression
-        self.compression_model = os.environ.get("COMPRESSION_MODEL", "small")  # Which model to use: small, middle, big
+        self.compression_model = os.environ.get("COMPRESSION_MODEL", "big")  # Which model to use: small, middle, big
         
         # Connection settings
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))

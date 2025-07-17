@@ -1,5 +1,7 @@
 import tiktoken
 import logging
+import json
+import asyncio
 from typing import Dict, Any, List, Union, Optional
 from src.core.config import config
 
@@ -129,7 +131,241 @@ class TokenManager:
         target_tokens = int(context_window * config.compression_target_ratio)
         
         logger.info(f"Proactively compressing messages to {target_tokens} tokens")
+        
+        # Try AI compression first if enabled
+        if config.enable_ai_compression:
+            try:
+                return self.ai_compress_messages(messages, model, target_tokens)
+            except Exception as e:
+                logger.warning(f"AI compression failed, falling back to truncation: {e}")
+        
+        # Fallback to truncation
         return self.truncate_messages(messages, target_tokens, model)
+
+    def ai_compress_messages(self, messages: List[Dict[str, Any]], model: str, target_tokens: int) -> List[Dict[str, Any]]:
+        """Use AI to intelligently compress messages."""
+        if not messages:
+            return messages
+            
+        # Separate system messages from conversation messages
+        system_messages = []
+        conversation_messages = []
+        
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_messages.append(msg)
+            else:
+                conversation_messages.append(msg)
+        
+        # Always keep system messages
+        compressed_messages = system_messages[:]
+        
+        # Calculate tokens used by system messages
+        system_tokens = self.count_message_tokens(system_messages, model)
+        remaining_tokens = target_tokens - system_tokens
+        
+        if remaining_tokens <= 0 or not conversation_messages:
+            return compressed_messages
+            
+        # If conversation is small enough, keep it as is
+        conversation_tokens = self.count_message_tokens(conversation_messages, model)
+        if conversation_tokens <= remaining_tokens:
+            compressed_messages.extend(conversation_messages)
+            return compressed_messages
+            
+        # Get AI summary of older messages
+        try:
+            summary = self._get_ai_summary(conversation_messages, model)
+            if summary:
+                # Create summary message
+                summary_message = {
+                    "role": "assistant",
+                    "content": f"[Previous conversation summary: {summary}]"
+                }
+                
+                # Keep recent messages + summary
+                recent_messages = []
+                summary_tokens = self.count_message_tokens([summary_message], model)
+                remaining_for_recent = remaining_tokens - summary_tokens
+                
+                # Intelligently select recent messages to preserve
+                recent_candidates = conversation_messages[-15:]  # Consider last 15 messages
+                
+                # Prioritize recent important messages
+                important_recent = []
+                regular_recent = []
+                
+                for msg in recent_candidates:
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        content_lower = content.lower()
+                        is_important = (
+                            msg.get("role") == "user" or  # User questions are important
+                            any(keyword in content_lower for keyword in [
+                                'error', 'exception', 'failed', 'warning', 'bug',
+                                'file', 'function', 'class', 'config', 'test'
+                            ]) or
+                            len(content) > 300  # Substantial messages
+                        )
+                        
+                        if is_important:
+                            important_recent.append(msg)
+                        else:
+                            regular_recent.append(msg)
+                
+                # Add important messages first, then regular ones if space allows
+                for msg_list in [important_recent, regular_recent]:
+                    for msg in reversed(msg_list):  # Most recent first
+                        msg_tokens = self.count_message_tokens([msg], model)
+                        if msg_tokens <= remaining_for_recent:
+                            recent_messages.insert(0, msg)
+                            remaining_for_recent -= msg_tokens
+                        elif remaining_for_recent > 100:  # Try to truncate if some space left
+                            content = msg.get("content", "")
+                            if isinstance(content, str) and len(content) > 200:
+                                truncated_content = content[-150:]  # Keep ending
+                                truncated_msg = msg.copy()
+                                truncated_msg["content"] = f"[...]{truncated_content}"
+                                msg_tokens = self.count_message_tokens([truncated_msg], model)
+                                if msg_tokens <= remaining_for_recent:
+                                    recent_messages.insert(0, truncated_msg)
+                                    remaining_for_recent -= msg_tokens
+                
+                # Build final compressed messages
+                compressed_messages.append(summary_message)
+                compressed_messages.extend(recent_messages)
+                
+                final_tokens = self.count_message_tokens(compressed_messages, model)
+                logger.info(f"AI compressed messages to {final_tokens} tokens (target: {target_tokens})")
+                return compressed_messages
+                
+        except Exception as e:
+            logger.error(f"AI compression failed: {e}")
+            
+        # If AI compression fails, fallback to truncation
+        return self.truncate_messages(messages, target_tokens, model)
+
+    def _get_ai_summary(self, messages: List[Dict[str, Any]], model: str) -> Optional[str]:
+        """Get AI summary of conversation messages."""
+        try:
+            # Import here to avoid circular dependency
+            import httpx
+            
+            # Get compression model
+            compression_model_name = getattr(config, f"{config.compression_model}_model")
+            
+            # Prepare conversation text for summarization, prioritizing important content
+            conversation_text = ""
+            important_keywords = [
+                'error', 'exception', 'traceback', 'failed', 'warning',
+                'config', 'setting', 'environment', 'variable',
+                'api', 'endpoint', 'database', 'schema',
+                'test', 'debug', 'fix', 'bug',
+                'file', 'path', 'function', 'class', 'method',
+                'import', 'dependency', 'library', 'version'
+            ]
+            
+            # Separate messages into important and regular
+            important_messages = []
+            regular_messages = []
+            
+            for msg in messages[:-5]:  # Process all but last 5 messages
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    content_lower = content.lower()
+                    is_important = (
+                        role == "system" or  # System messages are always important
+                        any(keyword in content_lower for keyword in important_keywords) or
+                        len(content) > 500  # Long messages likely contain important details
+                    )
+                    
+                    if is_important:
+                        important_messages.append(f"[IMPORTANT] {role}: {content}")
+                    else:
+                        regular_messages.append(f"{role}: {content}")
+            
+            # Prioritize important messages in the summary
+            if important_messages:
+                conversation_text += "=== CRITICAL INFORMATION ===\n"
+                conversation_text += "\n\n".join(important_messages[:10])  # Limit to 10 most important
+                conversation_text += "\n\n"
+            
+            if regular_messages:
+                conversation_text += "=== GENERAL CONVERSATION ===\n"
+                conversation_text += "\n\n".join(regular_messages[:5])  # Limit regular messages
+            
+            if not conversation_text.strip():
+                return None
+                
+            # Limit input size for summary request
+            if len(conversation_text) > 8000:  # Rough character limit
+                conversation_text = conversation_text[:8000] + "..."
+            
+            # Create summary request
+            summary_request = {
+                "model": compression_model_name,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """You are an expert code assistant that creates intelligent conversation summaries for ongoing development sessions. Your goal is to preserve CRITICAL information while reducing token usage.
+
+PRIORITY 1 - ALWAYS PRESERVE:
+• Current task/objective and its status
+• File paths, function names, and class names mentioned
+• Error messages, stack traces, and debugging information  
+• Configuration settings and environment variables
+• API endpoints, database schemas, and data structures
+• Dependencies, imports, and library versions
+• Test results and validation outcomes
+
+PRIORITY 2 - PRESERVE WHEN RELEVANT:
+• Code patterns and architectural decisions
+• Performance metrics and optimization details
+• Security considerations and access controls
+• Deployment and infrastructure details
+• User requirements and business logic
+
+PRIORITY 3 - SUMMARIZE OR OMIT:
+• Casual conversation and acknowledgments
+• Repetitive explanations of basic concepts
+• Multiple similar examples (keep one representative)
+• Verbose explanations (condense to key points)
+
+FORMAT: Create a structured summary with:
+1. **Current Task**: [What we're working on]
+2. **Key Files**: [Important file paths and components]
+3. **Critical Info**: [Errors, configs, decisions]
+4. **Context**: [Relevant background for continuing work]
+
+Keep summary under 200 words but ensure no critical development context is lost."""
+                    },
+                    {
+                        "role": "user", 
+                        "content": f"Summarize this development conversation, preserving all critical technical information:\n\n{conversation_text}"
+                    }
+                ],
+                "max_tokens": 300,
+                "temperature": 0.1
+            }
+            
+            # Make API call
+            with httpx.Client(
+                base_url=config.openai_base_url,
+                headers={"Authorization": f"Bearer {config.openai_api_key}"},
+                timeout=30.0
+            ) as client:
+                response = client.post("/chat/completions", json=summary_request)
+                response.raise_for_status()
+                
+                result = response.json()
+                summary = result["choices"][0]["message"]["content"]
+                logger.debug(f"Generated AI summary: {summary[:100]}...")
+                return summary
+                
+        except Exception as e:
+            logger.error(f"Failed to get AI summary: {e}")
+            return None
 
     def truncate_messages(self, messages: List[Dict[str, Any]],
                           max_tokens: int, model: str) -> List[Dict[str, Any]]:
