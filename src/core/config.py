@@ -23,6 +23,12 @@ class Config:
         self.max_input_tokens = int(os.environ.get("MAX_INPUT_TOKENS", "100000"))  # Input token limit
         self.enable_token_truncation = os.environ.get("ENABLE_TOKEN_TRUNCATION", "true").lower() == "true"
         
+        # Proactive compression settings
+        self.proactive_compression_threshold = float(os.environ.get("PROACTIVE_COMPRESSION_THRESHOLD", "0.8"))  # 80% of max tokens
+        self.compression_target_ratio = float(os.environ.get("COMPRESSION_TARGET_RATIO", "0.6"))  # Compress to 60% of max tokens
+        self.enable_ai_compression = os.environ.get("ENABLE_AI_COMPRESSION", "true").lower() == "true"  # Use AI for compression
+        self.compression_model = os.environ.get("COMPRESSION_MODEL", "small")  # Which model to use: small, middle, big
+        
         # Connection settings
         self.request_timeout = int(os.environ.get("REQUEST_TIMEOUT", "90"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "2"))

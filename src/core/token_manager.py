@@ -111,6 +111,26 @@ class TokenManager:
 
         return encoder.decode(truncated_tokens)
 
+    def should_proactively_compress(self, messages: List[Dict[str, Any]], model: str) -> bool:
+        """Check if messages should be proactively compressed."""
+        from src.core.config import config
+        
+        context_window = self.get_context_window_size(model)
+        current_tokens = self.count_message_tokens(messages, model)
+        threshold = int(context_window * config.proactive_compression_threshold)
+        
+        return current_tokens >= threshold
+
+    def proactively_compress_messages(self, messages: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
+        """Proactively compress messages before hitting token limit."""
+        from src.core.config import config
+        
+        context_window = self.get_context_window_size(model)
+        target_tokens = int(context_window * config.compression_target_ratio)
+        
+        logger.info(f"Proactively compressing messages to {target_tokens} tokens")
+        return self.truncate_messages(messages, target_tokens, model)
+
     def truncate_messages(self, messages: List[Dict[str, Any]],
                           max_tokens: int, model: str) -> List[Dict[str, Any]]:
         """Truncate messages to fit within token limit."""
@@ -125,7 +145,7 @@ class TokenManager:
         logger.warning(
             f"Messages exceed token limit ({current_tokens} > {max_tokens}), truncating...")
 
-        # Strategy: Keep system message and recent messages
+        # Enhanced strategy: Keep system messages, preserve recent conversation flow
         truncated_messages = []
         system_messages = []
         user_assistant_messages = []
@@ -144,30 +164,39 @@ class TokenManager:
         system_tokens = self.count_message_tokens(system_messages, model)
         remaining_tokens = max_tokens - system_tokens
 
-        # Add user/assistant messages from the end (most recent first)
-        for msg in reversed(user_assistant_messages):
-            msg_tokens = self.count_message_tokens([msg], model)
-
-            if msg_tokens <= remaining_tokens:
-                truncated_messages.insert(-len(system_messages)
-                                          if system_messages else 0, msg)
-                remaining_tokens -= msg_tokens
-            else:
-                # Try to truncate the message content if it's a text message
-                if (msg.get("role") in ["user", "assistant"] and
-                        isinstance(msg.get("content"), str)):
-
-                    # Reserve tokens for message overhead
-                    content_token_budget = remaining_tokens - 10
-                    if content_token_budget > 50:  # Only truncate if we have reasonable space
-                        truncated_content = self.truncate_text(
-                            msg["content"], content_token_budget, model, preserve_ending=False
-                        )
-                        truncated_msg = msg.copy()
-                        truncated_msg["content"] = truncated_content
-                        truncated_messages.insert(-len(system_messages)
-                                                  if system_messages else 0, truncated_msg)
-                break
+        # Preserve recent conversational flow by keeping pairs of user-assistant messages
+        if user_assistant_messages:
+            # Start from the most recent messages and work backwards
+            i = len(user_assistant_messages) - 1
+            recent_messages = []
+            
+            while i >= 0 and remaining_tokens > 0:
+                msg = user_assistant_messages[i]
+                msg_tokens = self.count_message_tokens([msg], model)
+                
+                # If this message fits, add it
+                if msg_tokens <= remaining_tokens:
+                    recent_messages.insert(0, msg)
+                    remaining_tokens -= msg_tokens
+                    i -= 1
+                else:
+                    # Try to truncate the message content if it's a text message
+                    if (msg.get("role") in ["user", "assistant"] and
+                            isinstance(msg.get("content"), str)):
+                        
+                        # Reserve tokens for message overhead
+                        content_token_budget = remaining_tokens - 10
+                        if content_token_budget > 100:  # Only truncate if we have reasonable space
+                            truncated_content = self.truncate_text(
+                                msg["content"], content_token_budget, model, preserve_ending=True
+                            )
+                            truncated_msg = msg.copy()
+                            truncated_msg["content"] = f"[...truncated...]\n{truncated_content}"
+                            recent_messages.insert(0, truncated_msg)
+                    break
+            
+            # Add the preserved messages after system messages
+            truncated_messages.extend(recent_messages)
 
         final_tokens = self.count_message_tokens(truncated_messages, model)
         logger.info(
