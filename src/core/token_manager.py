@@ -18,10 +18,29 @@ class TokenManager:
         """Get or create tiktoken encoder for the specified model."""
         if model not in self.encoders:
             try:
-                # Try to get encoding for the specific model
-                self.encoders[model] = tiktoken.encoding_for_model(model)
+                # Claude模型映射到对应的tiktoken编码
+                claude_model_mapping = {
+                    "claude-3-5-haiku-20241022": "cl100k_base",
+                    "claude-sonnet-4-20250514": "cl100k_base",
+                    "claude-3-5-sonnet-20241022": "cl100k_base",
+                    "claude-3-opus-20240229": "cl100k_base",
+                    "claude-3-haiku-20240307": "cl100k_base",
+                }
+
+                # 检查是否为 Claude 模型
+                if model in claude_model_mapping:
+                    logger.debug(
+                        f"使用 Claude 模型映射：{model} -> "
+                        f"{claude_model_mapping[model]}"
+                    )
+                    self.encoders[model] = tiktoken.get_encoding(
+                        claude_model_mapping[model]
+                    )
+                else:
+                    # 尝试获取特定模型的编码
+                    self.encoders[model] = tiktoken.encoding_for_model(model)
             except KeyError:
-                # Fallback to cl100k_base encoding for most GPT models
+                # 回退到 cl100k_base 编码
                 logger.warning(
                     f"Model {model} not found, using cl100k_base encoding")
                 self.encoders[model] = tiktoken.get_encoding("cl100k_base")
@@ -34,7 +53,8 @@ class TokenManager:
         encoder = self.get_encoder(model)
         return len(encoder.encode(text))
 
-    def count_message_tokens(self, messages: List[Dict[str, Any]], model: str) -> int:
+    def count_message_tokens(self, messages: List[Dict[str, Any]],
+                             model: str) -> int:
         """Count tokens in a list of messages."""
         encoder = self.get_encoder(model)
         total_tokens = 0
@@ -65,12 +85,14 @@ class TokenManager:
                 elif isinstance(content, list):
                     # Handle multimodal content
                     for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
+                        if isinstance(item, dict) and \
+                           item.get("type") == "text":
                             text_content = item.get("text", "")
                             total_tokens += len(encoder.encode(text_content))
-                        elif isinstance(item, dict) and item.get("type") == "image_url":
-                            # Rough estimation for images (adjust based on your needs)
-                            total_tokens += 85  # Base token cost for images
+                        elif isinstance(item, dict) and \
+                                item.get("type") == "image_url":
+                            # Rough estimation for images
+                            total_tokens += 85  # Base token cost
 
             # Count tokens in name field if present
             if "name" in message:
@@ -379,7 +401,8 @@ Keep summary under 200 words but ensure no critical development context is lost.
             return messages
 
         logger.warning(
-            f"Messages exceed token limit ({current_tokens} > {max_tokens}), truncating...")
+            f"Messages exceed token limit ({current_tokens} > {max_tokens}), "
+            f"truncating...")
 
         # Enhanced strategy: Keep system messages, preserve recent conversation flow
         truncated_messages = []
@@ -436,9 +459,198 @@ Keep summary under 200 words but ensure no critical development context is lost.
 
         final_tokens = self.count_message_tokens(truncated_messages, model)
         logger.info(
-            f"Truncated messages from {current_tokens} to {final_tokens} tokens")
+            f"Truncated from {current_tokens} to {final_tokens} tokens")
 
+        logger.debug(f"原始截断策略返回 {len(truncated_messages)} 条消息")
         return truncated_messages
+
+    def truncate_messages_smart(self, messages: List[Dict[str, Any]],
+                                max_tokens: int, model: str,
+                                preserve_recent_turns: int = 2,
+                                compression_ratio: float = 0.3
+                                ) -> List[Dict[str, Any]]:
+        """
+        智能截断策略：保护最近对话轮次，压缩历史内容
+
+        Args:
+            messages: 消息列表
+            max_tokens: 最大token限制
+            model: 模型名称
+            preserve_recent_turns: 保护最近几轮完整对话
+            compression_ratio: 历史内容压缩比例
+        """
+        if not messages:
+            return messages
+
+        current_tokens = self.count_message_tokens(messages, model)
+        if current_tokens <= max_tokens:
+            logger.debug(f"消息token数量({current_tokens})在限制内，无需压缩")
+            return messages
+
+        logger.info(f"启动智能压缩: {current_tokens} -> {max_tokens} tokens")
+        logger.debug(
+            f"压缩参数: 保留 {preserve_recent_turns} 轮对话, "
+            f"压缩比 {compression_ratio}")
+
+        # 分离不同类型的消息
+        system_messages = []
+        conversation_messages = []
+
+        for msg in messages:
+            if msg.get("role") == "system":
+                system_messages.append(msg)
+            else:
+                conversation_messages.append(msg)
+
+        # 始终保留系统消息
+        result_messages = system_messages.copy()
+        system_tokens = self.count_message_tokens(system_messages, model)
+        remaining_tokens = max_tokens - system_tokens
+
+        logger.debug(
+            f"系统消息占用 {system_tokens} tokens，剩余 {remaining_tokens} tokens")
+
+        if remaining_tokens <= 0:
+            logger.warning("系统消息已超出token限制！")
+            return system_messages
+
+        # 提取最近的对话轮次
+        recent_messages = self._extract_recent_turns(
+            conversation_messages, preserve_recent_turns)
+        recent_tokens = self.count_message_tokens(recent_messages, model)
+
+        logger.debug(
+            f"最近 {preserve_recent_turns} 轮对话占用 {recent_tokens} tokens")
+
+        # 如果最近对话已经超限，采用保守策略
+        if recent_tokens >= remaining_tokens:
+            logger.warning("最近对话已接近token限制，采用保守截断")
+            return result_messages + self._conservative_truncate(
+                recent_messages, remaining_tokens, model)
+
+        # 计算历史消息
+        history_messages = (
+            conversation_messages[:-len(recent_messages)]
+            if recent_messages else conversation_messages
+        )
+        available_for_history = remaining_tokens - recent_tokens
+
+        logger.debug(f"历史消息可用 {available_for_history} tokens")
+
+        # 压缩历史消息
+        compressed_history = []
+        if history_messages and available_for_history > 100:  # 至少保留一些历史
+            compressed_history = self._compress_historical_messages(
+                history_messages, available_for_history, model,
+                compression_ratio
+            )
+
+        # 组装最终结果
+        result_messages.extend(compressed_history)
+        result_messages.extend(recent_messages)
+
+        final_tokens = self.count_message_tokens(result_messages, model)
+        logger.info(f"智能压缩完成: {current_tokens} -> {final_tokens} tokens")
+
+        # 验证压缩效果
+        if final_tokens > max_tokens:
+            logger.warning(f"压缩后仍超限: {final_tokens} > {max_tokens}")
+        else:
+            compression_rate = (current_tokens - final_tokens) / \
+                current_tokens * 100
+            logger.debug(f"压缩成功，压缩率: {compression_rate:.1f}%")
+
+        return result_messages
+
+    def _extract_recent_turns(self, messages: List[Dict[str, Any]],
+                              preserve_turns: int) -> List[Dict[str, Any]]:
+        """提取最近几轮完整的用户-助手对话"""
+        if not messages or preserve_turns <= 0:
+            return []
+
+        # 从后往前找完整的对话轮次
+        recent_messages = []
+        turn_count = 0
+        i = len(messages) - 1
+
+        while i >= 0 and turn_count < preserve_turns:
+            current_msg = messages[i]
+            recent_messages.insert(0, current_msg)
+
+            # 如果遇到用户消息，说明完成了一轮对话
+            if current_msg.get("role") == "user":
+                turn_count += 1
+
+            i -= 1
+
+        return recent_messages
+
+    def _compress_historical_messages(self, messages: List[Dict[str, Any]],
+                                      available_tokens: int, model: str,
+                                      compression_ratio: float
+                                      ) -> List[Dict[str, Any]]:
+        """压缩历史消息"""
+        if not messages:
+            return []
+
+        current_history_tokens = self.count_message_tokens(messages, model)
+        target_tokens = int(available_tokens * compression_ratio)
+
+        logger.debug(
+            f"历史消息压缩: {current_history_tokens} -> {target_tokens} tokens")
+
+        if current_history_tokens <= target_tokens:
+            return messages
+
+        # 简单策略：从最老的消息开始删除
+        compressed = []
+        tokens_used = 0
+
+        # 从最新的历史消息开始保留
+        for msg in reversed(messages):
+            msg_tokens = self.count_message_tokens([msg], model)
+            if tokens_used + msg_tokens <= target_tokens:
+                compressed.insert(0, msg)
+                tokens_used += msg_tokens
+            else:
+                # 尝试截断这个消息的内容
+                if (msg.get("role") in ["user", "assistant"] and
+                    isinstance(msg.get("content"), str) and
+                        target_tokens - tokens_used > 50):
+
+                    remaining_budget = target_tokens - tokens_used - 10
+                    truncated_content = self.truncate_text(
+                        msg["content"], remaining_budget, model,
+                        preserve_ending=True
+                    )
+                    truncated_msg = msg.copy()
+                    truncated_msg["content"] = (
+                        f"[历史对话摘要]...{truncated_content}")
+                    compressed.insert(0, truncated_msg)
+                break
+
+        return compressed
+
+    def _conservative_truncate(self, messages: List[Dict[str, Any]],
+                               max_tokens: int, model: str
+                               ) -> List[Dict[str, Any]]:
+        """保守的截断策略，确保不超过token限制"""
+        if not messages:
+            return []
+
+        result = []
+        tokens_used = 0
+
+        # 从最新消息开始保留
+        for msg in reversed(messages):
+            msg_tokens = self.count_message_tokens([msg], model)
+            if tokens_used + msg_tokens <= max_tokens:
+                result.insert(0, msg)
+                tokens_used += msg_tokens
+            else:
+                break
+
+        return result
 
     def get_context_window_size(self, model: str) -> int:
         """Get the context window size for a model."""
