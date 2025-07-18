@@ -9,6 +9,7 @@ from openai._exceptions import (
 from fastapi import HTTPException
 
 from .retry_handler import retry_handler
+from .monitor import system_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +50,9 @@ class OpenAIClient:
     ) -> Dict[str, Any]:
         """Send chat completion to OpenAI API with cancellation support."""
 
-        # Create cancellation token if request_id provided
+        # Start monitoring request
         if request_id:
+            system_monitor.start_request(request_id)
             cancel_event = asyncio.Event()
             self.active_requests[request_id] = cancel_event
 
@@ -69,34 +71,51 @@ class OpenAIClient:
                     raise HTTPException(
                         status_code=499, detail="Request cancelled by client")
 
+            # Record token usage if available
+            if 'usage' in completion:
+                usage = completion['usage']
+                system_monitor.record_token_usage(
+                    prompt_tokens=usage.get('prompt_tokens', 0),
+                    completion_tokens=usage.get('completion_tokens', 0),
+                    total_tokens=usage.get('total_tokens', 0)
+                )
+
             return completion
 
         except HTTPException:
             # Re-raise cancellation exceptions
             raise
         except AuthenticationError as e:
+            system_monitor.record_error()
             raise HTTPException(
                 status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
+            system_monitor.record_error()
+            system_monitor.record_rate_limit()
             raise HTTPException(
                 status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
+            system_monitor.record_error()
             raise HTTPException(
                 status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
+            system_monitor.record_error()
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(
                 status_code=status_code,
                 detail=self.classify_openai_error(str(e))
             )
         except Exception as e:
+            system_monitor.record_error()
             raise HTTPException(
                 status_code=500, detail=f"Unexpected error: {str(e)}")
 
         finally:
             # Clean up active request tracking
-            if request_id and request_id in self.active_requests:
-                del self.active_requests[request_id]
+            if request_id:
+                if request_id in self.active_requests:
+                    del self.active_requests[request_id]
+                system_monitor.end_request(request_id)
 
     async def create_chat_completion_stream(
         self,
@@ -105,8 +124,9 @@ class OpenAIClient:
     ) -> AsyncGenerator[str, None]:
         """Send streaming chat completion to OpenAI API with cancellation support."""
 
-        # Create cancellation token if request_id provided
+        # Start monitoring request
         if request_id:
+            system_monitor.start_request(request_id)
             cancel_event = asyncio.Event()
             self.active_requests[request_id] = cancel_event
 
@@ -141,28 +161,36 @@ class OpenAIClient:
             yield "data: [DONE]"
 
         except AuthenticationError as e:
+            system_monitor.record_error()
             raise HTTPException(
                 status_code=401, detail=self.classify_openai_error(str(e)))
         except RateLimitError as e:
+            system_monitor.record_error()
+            system_monitor.record_rate_limit()
             raise HTTPException(
                 status_code=429, detail=self.classify_openai_error(str(e)))
         except BadRequestError as e:
+            system_monitor.record_error()
             raise HTTPException(
                 status_code=400, detail=self.classify_openai_error(str(e)))
         except APIError as e:
+            system_monitor.record_error()
             status_code = getattr(e, 'status_code', 500)
             raise HTTPException(
                 status_code=status_code,
                 detail=self.classify_openai_error(str(e))
             )
         except Exception as e:
+            system_monitor.record_error()
             raise HTTPException(
                 status_code=500, detail=f"Unexpected error: {str(e)}")
 
         finally:
             # Clean up active request tracking
-            if request_id and request_id in self.active_requests:
-                del self.active_requests[request_id]
+            if request_id:
+                if request_id in self.active_requests:
+                    del self.active_requests[request_id]
+                system_monitor.end_request(request_id)
 
     def classify_openai_error(self, error_detail: Any) -> str:
         """Provide specific error guidance for common OpenAI API issues."""

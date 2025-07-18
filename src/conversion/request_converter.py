@@ -79,17 +79,13 @@ def convert_claude_to_openai(
         input_tokens = token_manager.count_message_tokens(openai_messages, openai_model)
         logger.debug(f"Input tokens before truncation: {input_tokens}")
         
-        # Check for proactive compression first
-        if token_manager.should_proactively_compress(openai_messages, openai_model):
-            openai_messages = token_manager.proactively_compress_messages(openai_messages, openai_model)
-            final_tokens = token_manager.count_message_tokens(openai_messages, openai_model)
-            logger.info(f"Proactively compressed messages from {input_tokens} to {final_tokens} tokens")
-        elif input_tokens > config.max_input_tokens:
-            openai_messages = token_manager.truncate_messages(
+        # Use smart truncate for all cases above the limit
+        if input_tokens > config.max_input_tokens:
+            openai_messages = token_manager.smart_truncate(
                 openai_messages, config.max_input_tokens, openai_model
             )
             final_tokens = token_manager.count_message_tokens(openai_messages, openai_model)
-            logger.info(f"Truncated input from {input_tokens} to {final_tokens} tokens")
+            logger.info(f"Smart truncated input from {input_tokens} to {final_tokens} tokens")
 
     # Build OpenAI request
     openai_request = {
